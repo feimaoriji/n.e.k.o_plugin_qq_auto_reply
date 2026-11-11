@@ -9,6 +9,9 @@
 # **重新同步上游时必须把这些重新应用**，否则会静默回退（私聊发图消失、群图只试旧式直传），
 # 或者更糟：漏掉 qq_open_platform_media.py 会让整个副本包 import 失败。
 # 明细与同步顺序见同目录 PROVENANCE.md；守卫见 tests/test_qq_connector_seam.py。
+# 另有一处插件侧事件支持：GROUP_MESSAGE_CREATE（官方后台开启「接收所有群消息」后的
+# 群事件），正文 @ 写作 <@openid>/<@all>、@ 目标另走结构化 mentions[]；上游尚未处理，
+# 重新同步时同样要保留，否则全量模式下群里 @ 机器人会被静默丢弃。
 # 注意：本副本与上游恰好同为 1126 行，行数不能用来判断是否一致。
 
 from __future__ import annotations
@@ -26,6 +29,11 @@ from . import qq_open_platform_media
 from .onebot_connection import OneBotConnectionBase
 
 _CQ_CODE_RE = _re.compile(r"\[CQ:(\w+),([^\]]+)\]")
+
+#: Inline @ placeholder in a group body: ``<@openid>``, ``<@!openid>`` and
+#: ``<@all>``. Full-group events also list the targets structurally in
+#: ``mentions``, but the body still carries these; group 1 is the target.
+_INLINE_AT_RE = _re.compile(r"<@!?([^>]*)>")
 
 # ==========================================
 # R11 identity scope: resolved
@@ -63,7 +71,7 @@ _CQ_CODE_RE = _re.compile(r"\[CQ:(\w+),([^\]]+)\]")
 # undocumented union_openid sibling key), so keeping them lets us confirm on a live
 # bot. Default off; never participates in any decision.
 _IDENTITY_PROBE_TAG = "[R11]"
-_IDENTITY_PROBE_EVENTS = ("GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE")
+_IDENTITY_PROBE_EVENTS = ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE", "C2C_MESSAGE_CREATE")
 #: Max lines recorded per connection. Forensics only needs three (group X, group Y,
 #: private each); the cap exists so the log doesn't grow unbounded if the switch is
 #: left on, not to limit forensics.
@@ -165,6 +173,43 @@ def pick_actor_id(author: Any, keys: tuple[str, ...]) -> str:
         if value:
             return value
     return ""
+
+
+#: Nickname the platform uses for an ``@all`` mention.
+_MENTION_ALL_NICKNAME = "全体成员"
+
+
+def normalize_group_mentions(data: Any) -> list[dict[str, Any]]:
+    """Read a full-group event's structured ``mentions`` array; never raises.
+
+    ``GROUP_MESSAGE_CREATE`` carries the @ targets here (official field table:
+    ``id`` / ``member_openid`` / ``union_openid`` / ``nickname`` / ``bot``)
+    instead of only as inline body placeholders. The field table does not
+    promise that every live payload is well-formed, though, and an exception
+    escaping into ``_receive_loop``'s catch-all looks exactly like a dropped
+    connection -- so a missing key, a non-list ``mentions``, or a non-object
+    entry degrades to "no information" here. ``union_openid`` is deliberately
+    not kept: nothing downstream may key on it (see the R11 note at module top).
+    """
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("mentions")
+    if not isinstance(raw, list):
+        return []
+    mentions: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        mentions.append({
+            "id": str(item.get("id") or "").strip(),
+            "member_openid": str(item.get("member_openid") or "").strip(),
+            "nickname": str(item.get("nickname") or "").strip(),
+            # Only a real JSON ``true`` counts as "this target is a bot": a
+            # truthy string such as "false" must not make the bot think it was
+            # addressed.
+            "bot": item.get("bot") is True,
+        })
+    return mentions
 
 
 class QQOpenPlatformConnection(OneBotConnectionBase):
@@ -474,7 +519,7 @@ class QQOpenPlatformConnection(OneBotConnectionBase):
                     # trusted-group whitelist gate so an unconfigured group can still
                     # be sampled.
                     self._log_identity_probe(event_type, payload.get("d"))
-                    if event_type in ("GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
+                    if event_type in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
                         msg = self._convert_event(event_type, payload["d"])
                         if msg:
                             try:
@@ -1017,6 +1062,80 @@ class QQOpenPlatformConnection(OneBotConnectionBase):
                 "is_at_bot": True,
                 "is_reply_to_bot": False,
                 "group_id": group_id,
+                "quoted_message_id": "",
+                "mentioned_user_ids": mentioned_ids,
+                "mentions_other_user": mentions_other_user,
+                "mentions_all": mentions_all,
+                "raw": data,
+                "attachments": self._extract_attachments(data),
+            }
+
+        if event_type == "GROUP_MESSAGE_CREATE":
+            # "Receive all group messages" mode: the platform pushes every group
+            # message as GROUP_MESSAGE_CREATE, not only the @-bot ones as
+            # GROUP_AT_MESSAGE_CREATE. The payload is the @-only shape plus a
+            # structured ``mentions`` array, and the body spells @ targets as
+            # ``<@openid>`` / ``<@all>`` (official docs: event/group_message_create).
+            #
+            # A message that does not address the bot is still a real message:
+            # whether to speak is the downstream attention gate's call, never this
+            # converter's. The only reason to drop one here is our own echo --
+            # otherwise the bot's output comes back in as a user turn and can feed
+            # a reply loop.
+            author_id = pick_actor_id(author, _GROUP_ACTOR_ID_KEYS)
+            self_id = str(getattr(self, "_self_id", "") or "")
+            if self_id and author_id == self_id:
+                return None
+
+            content = str(data.get("content") or "")
+            mentions = normalize_group_mentions(data)
+            mentioned_ids: list[str] = []
+            for target in [
+                m.group(1) for m in _INLINE_AT_RE.finditer(content) if m.group(1) != "all"
+            ] + [m["id"] or m["member_openid"] for m in mentions]:
+                if target and target not in mentioned_ids:
+                    mentioned_ids.append(target)
+
+            mentions_all = (
+                "<@all>" in content
+                or any(m["nickname"] == _MENTION_ALL_NICKNAME for m in mentions)
+                or any(m["id"] == "all" for m in mentions)
+            )
+            if self_id:
+                is_at_bot = any(
+                    m["bot"] and self_id in (m["id"], m["member_openid"])
+                    for m in mentions
+                )
+            else:
+                # Without READY's self id an openid cannot be matched; the bot flag
+                # is the only signal left, the same degraded stance the @-only
+                # branch takes for mentions_other_user.
+                is_at_bot = any(m["bot"] for m in mentions)
+            # @all addresses the bot too; the platform adds no separate self
+            # mention for it.
+            is_at_bot = is_at_bot or mentions_all
+
+            if self_id:
+                mentions_other_user = any(mid != self_id for mid in mentioned_ids)
+            else:
+                mentions_other_user = len(mentioned_ids) > 1
+
+            return {
+                "message_type": "group",
+                "channel": self.CHANNEL,
+                "user_id": author_id,
+                "user_nickname": user_nickname,
+                "content": _INLINE_AT_RE.sub("", content).strip(),
+                "message_id": str(data.get("id") or ""),
+                "timestamp": int(time.time()),
+                "is_at_bot": is_at_bot,
+                # Conservative: this event has no reply/quote field to read, and
+                # inferring "replied to the bot" from a mention would make the
+                # bot treat any @ as a direct reply.
+                "is_reply_to_bot": False,
+                # Same precedence as the @-only branch: group_id wins, the openid
+                # key is only the fallback (re-keying would orphan scoped memory).
+                "group_id": str(data.get("group_id") or data.get("group_openid") or ""),
                 "quoted_message_id": "",
                 "mentioned_user_ids": mentioned_ids,
                 "mentions_other_user": mentions_other_user,
